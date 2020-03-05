@@ -23,6 +23,7 @@ import           Prelude (String, show, id)
 import           Data.Aeson (Value (..), toJSON, (.=))
 import           Data.Text (pack)
 import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Vector as V
 import qualified Network.Socket as Socket (SockAddr)
 import           Network.Mux (WithMuxBearer (..), MuxTrace (..))
 
@@ -50,7 +51,8 @@ import qualified Ouroboros.Consensus.Protocol.BFT as BFT
 import qualified Ouroboros.Consensus.Protocol.PBFT as PBFT
 import           Ouroboros.Consensus.Ledger.Extended
 import           Ouroboros.Consensus.Mempool.API (GenTx, GenTxId,
-                   HasTxId, TraceEventMempool (..), TxId, txId)
+                   HasTxId, HasTxs(..), TraceEventMempool (..), TxId,
+                   extractTxs, txId)
 import qualified Ouroboros.Consensus.Mock.Ledger as Mock
 import qualified Ouroboros.Consensus.Mock.Protocol.Praos as Praos
 import           Ouroboros.Consensus.Node.Tracers (TraceForgeEvent (..))
@@ -66,8 +68,10 @@ import           Ouroboros.Network.BlockFetch.ClientState
                    (TraceFetchClientState (..), TraceLabelPeer (..))
 import           Ouroboros.Network.BlockFetch.Decision (FetchDecision)
 import           Ouroboros.Network.Codec (AnyMessage (..))
+import           Ouroboros.Network.Driver.Simple (TraceSendRecv)
 import           Ouroboros.Network.NodeToNode
                    (WithAddr(..), ErrorPolicyTrace(..), TraceSendRecv (..))
+import           Ouroboros.Network.Protocol.BlockFetch.Type (BlockFetch, Message(..))
 import           Ouroboros.Network.Protocol.TxSubmission.Type
                    (Message (..), TxSubmission)
 import           Ouroboros.Network.Subscription (ConnectResult (..), DnsTrace (..),
@@ -335,16 +339,12 @@ instance DefineSeverity [TraceLabelPeer peer
   defineSeverity [] = Debug
   defineSeverity _ = Info
 
-instance DefinePrivacyAnnotation (TraceLabelPeer peer
-                                  (TraceFetchClientState header))
-instance DefineSeverity (TraceLabelPeer peer
-                         (TraceFetchClientState header)) where
+instance DefinePrivacyAnnotation (TraceFetchClientState header)
+instance DefineSeverity (TraceFetchClientState header) where
   defineSeverity _ = Info
 
-instance DefinePrivacyAnnotation (TraceLabelPeer peer
-                                  (TraceSendRecv (TxSubmission txid tx)))
-instance DefineSeverity (TraceLabelPeer peer
-                         (TraceSendRecv (TxSubmission txid tx))) where
+instance DefinePrivacyAnnotation (TraceSendRecv (TxSubmission txid tx))
+instance DefineSeverity (TraceSendRecv (TxSubmission txid tx)) where
   defineSeverity _ = Debug
 
 instance DefinePrivacyAnnotation (TraceBlockFetchServerEvent blk)
@@ -402,13 +402,16 @@ instance Show peer => Transformable Text IO [TraceLabelPeer peer
   trTransformer _ verb tr = trStructured verb tr
 
 -- transform @BlockFetchDecision@
-instance Show peer => Transformable Text IO (TraceLabelPeer peer
-                                (TraceFetchClientState header)) where
+instance {-# OVERLAPS #-}
+  Show peer
+ => Transformable Text IO (TraceLabelPeer peer
+                            (TraceFetchClientState header)) where
   trTransformer _ verb tr = trStructured verb tr
 
-instance (Show peer, Show txid, Show tx)
-      => Transformable Text IO (TraceLabelPeer peer
-           (TraceSendRecv (TxSubmission txid tx))) where
+instance {-# OVERLAPS #-}
+  (Show peer, Show txid, Show tx)
+ => Transformable Text IO (TraceLabelPeer peer
+                           (TraceSendRecv (TxSubmission txid tx))) where
   trTransformer = defaultTextTransformer
 
 -- transform @BlockFetchServerEvent@
@@ -439,6 +442,51 @@ instance ( Condense (HeaderHash blk)
     traceWith tr (mempty, LogObject mempty meta (LogMessage $ pack s))
   -- user defined formatting of log output
   trTransformer _ verb tr = trStructured verb tr
+
+instance DefinePrivacyAnnotation a => DefinePrivacyAnnotation (TraceLabelPeer peer a)
+instance DefineSeverity a => DefineSeverity (TraceLabelPeer peer a)
+
+instance (Transformable Text IO a) => Transformable Text IO (TraceLabelPeer peer a) where
+  trTransformer f v t = Tracer $ \(TraceLabelPeer _peer a) ->
+    traceWith (trTransformer f v t) a
+instance DefinePrivacyAnnotation (TraceSendRecv (BlockFetch blk))
+instance DefineSeverity (TraceSendRecv (BlockFetch blk)) where
+  defineSeverity _ = Debug
+
+instance ( Show blk
+         , StandardHash blk
+         , ToObject (AnyMessage (BlockFetch blk))
+         )
+ => Transformable Text IO (TraceSendRecv (BlockFetch blk)) where
+  trTransformer = defaultTextTransformer
+
+instance ( ToObject (AnyMessage ps)
+         )
+ => ToObject (TraceSendRecv ps) where
+  toObject verb (TraceSendMsg m) = mkObject
+    [ "kind" .= String "Send" , "msg" .= toObject verb m ]
+  toObject verb (TraceRecvMsg m) = mkObject
+    [ "kind" .= String "Recv" , "msg" .= toObject verb m ]
+
+instance ( Condense (HeaderHash blk)
+         , Condense (TxId (GenTx blk))
+         , HasHeader blk
+         , HasTxs blk
+         , HasTxId (GenTx blk)
+         )
+ => ToObject (AnyMessage (BlockFetch blk)) where
+  toObject _verb (AnyMessage (MsgBlock blk)) =
+    mkObject
+      [ "kind" .= String "MsgBlock"
+      , "blkid" .= String (pack . condense $ blockHash blk)
+      , "txids" .= Array (V.fromList . fmap presentTx $ extractTxs blk)
+      ]
+   where
+     presentTx :: GenTx blk -> Value
+     presentTx =  String . pack . condense . txId
+  toObject _verb _ =
+    mkObject
+      [ "kind" .= String "BlockFetchSomething" ]
 
 instance (Show (GenTx blk), Show (GenTxId blk))
       => Transformable Text IO (TraceEventMempool blk) where
@@ -897,8 +945,9 @@ instance Show peer => ToObject [TraceLabelPeer peer
   toObject MaximalVerbosity (lbl : r) = toObject MaximalVerbosity lbl <>
                                         toObject MaximalVerbosity r
 
-instance Show peer => ToObject (TraceLabelPeer peer
-                        (FetchDecision [Point header])) where
+instance {-# OVERLAPS #-}
+  Show peer
+ => ToObject (TraceLabelPeer peer (FetchDecision [Point header])) where
   toObject verb (TraceLabelPeer peerid a) =
     mkObject [ "kind" .= String "FetchDecision"
              , "peer" .= show peerid
@@ -912,9 +961,9 @@ instance ToObject (FetchDecision [Point header]) where
     mkObject [ "kind" .= String "FetchDecision results"
              , "length" .= String (pack $ show $ length results) ]
 
-instance (Show peer, Show txid, Show tx)
-    => ToObject (TraceLabelPeer peer
-         (TraceSendRecv (TxSubmission txid tx))) where
+instance {-# OVERLAPS #-}
+  (Show peer, Show txid, Show tx)
+ => ToObject (TraceLabelPeer peer (TraceSendRecv (TxSubmission txid tx))) where
   toObject verb (TraceLabelPeer peerid (TraceSendMsg (AnyMessage msg))) =
     mkObject
       [ "kind" .= String "TraceSendMsg"
@@ -953,8 +1002,9 @@ instance (Show txid, Show tx) => ToObject (Message
       [ "kind" .= String "MsgDone"
       ]
 
-instance Show peer => ToObject (TraceLabelPeer peer
-                        (TraceFetchClientState header)) where
+instance {-# OVERLAPS #-}
+  Show peer
+ => ToObject (TraceLabelPeer peer (TraceFetchClientState header)) where
   toObject verb (TraceLabelPeer peerid a) =
     mkObject [ "kind" .= String "TraceFetchClientState"
            , "peer" .= show peerid
